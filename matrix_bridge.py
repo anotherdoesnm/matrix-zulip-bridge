@@ -26,6 +26,8 @@ from nio.responses import (
     Response,
     SyncError,
     SyncResponse,
+    RoomGetStateEventResponse,
+    RoomGetStateEventError
 )
 
 import zulip
@@ -264,24 +266,51 @@ class ZulipToMatrix:
         ).result()
         if isinstance(result, nio.RoomSendError):
             raise BridgeFatalMatrixError(str(result))
-
+    def _get_state(self, room_id, event_type, state_key) -> Union[RoomGetStateResponse,RoomGetStateEventError, None]:
+        """Wrapper for getting room state"""
+        result: Union[Response,ErrorResponse] = asyncio.run_coroutine_threadsafe(
+            self.matrix_client.room_get_state_event(room_id, event_type, state_key=state_key), self.loop
+        ).result()
+        if isinstance(result,ErrorResponse) and result.status_code == "M_NOT_FOUND": return None
+        if isinstance(result,ErrorResponse):
+          raise BridgeFatalMatrixError(str(result))
+        return result.content
+    def _put_state(self, room_id, event_type, content, state_key) -> None:
+      """Wrapper for setting room state"""
+      result: Union[Response,ErrorResponse] = asyncio.run_coroutine_threadsafe(
+          self.matrix_client.room_put_state(room_id, event_type, content, state_key=state_key), self.loop
+      ).result()
+      if isinstance(result, ErrorResponse):
+        raise BridgeFatalMatrixError(str(result))
     def _zulip_to_matrix(self, msg: Dict[str, Any]) -> None:
         logging.debug("_zulip_to_matrix; msg: %s", msg)
 
         room_id: Optional[str] = self.get_matrix_room_for_zulip_message(msg)
         if room_id is None:
             return
-
         sender: str = msg["sender_full_name"]
         content: str = MATRIX_MESSAGE_TEMPLATE.format(
             username=sender, uid=msg["sender_id"], message=msg["content"]
         )
-        
+        avatar = self._get_state(room_id, "xyz.doesnmlab.matrix-zulip-bridge.avatars", f"zulip_user_{msg['sender_id']}")
+        if avatar == None:
+          with urllib.request.urlopen(self.server_url + msg["avatar_url"]) as response:
+            file_content: bytes = response.read()
+
+            response, _ = asyncio.run_coroutine_threadsafe(self.matrix_client.upload(
+                data_provider=BytesIO(file_content), filename=f"zulip_user_{msg['sender_id']}_avatar.png"
+            ), self.loop).result()
+            if isinstance(response, nio.UploadError):
+              avatar = ""
+            self._put_state(room_id, "xyz.doesnmlab.matrix-zulip-bridge.avatars", {'avatar_uri': response.content_uri}, f"zulip_user_{msg['sender_id']}")
+            avatar = response.content_uri
+        else:
+          avatar = avatar['avatar_uri']
         # Forward Zulip message /to Matrix.
         self._matrix_send(
             room_id=room_id,
             message_type="m.room.message",
-            content={"msgtype": "m.text", "body": content, "com.beeper.per_message_profile": {"id":f"zulip_user_{msg['sender_id']}","displayname":sender,"has_fallback":True}},
+            content={"msgtype": "m.text", "body": content, "com.beeper.per_message_profile": {"id":f"zulip_user_{msg['sender_id']}","displayname":sender,"has_fallback":True,"avatar_url":avatar}},
         )
 
         # Get embedded files.
@@ -595,9 +624,7 @@ def write_sample_config(target_path: str, zuliprc: Optional[str]) -> None:
                         ("host", "https://matrix.org"),
                         ("mxid", "@username:matrix.org"),
                         ("password", "password"),
-                        ("device_id","null"),
-                        ("access_token","null"),
-                        ("room_id", "#zulip:matrix.org"),
+                        ("room_id", "!abcdefghijklmnopqrstuvwxyz"),
                     )
                 ),
             ),
